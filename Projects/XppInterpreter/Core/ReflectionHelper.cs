@@ -34,12 +34,15 @@ namespace XppInterpreter.Core
             return Activator.CreateInstance(makeType, arg1, arg2);
         }
 
-        public static bool TypeHasMethod(Type type, string methodName)
-        {
-            if (type is null) return false;
+        // Every global function call of a script looks its method up by name: the methods of a type don't change while the process runs
+        private static readonly System.Collections.Concurrent.ConcurrentDictionary<Tuple<Type, string>, MethodInfo> MethodsByName =
+            new System.Collections.Concurrent.ConcurrentDictionary<Tuple<Type, string>, MethodInfo>();
 
-            return type.GetMethods().Any(m => m.Name?.ToLower() == methodName.ToLower());
-        }
+        private static MethodInfo FindMethod(Type type, string methodName) =>
+            type is null ? null : MethodsByName.GetOrAdd(Tuple.Create(type, methodName.ToLowerInvariant()),
+                key => key.Item1.GetMethods().FirstOrDefault(m => m.Name.ToLowerInvariant() == key.Item2));
+
+        public static bool TypeHasMethod(Type type, string methodName) => FindMethod(type, methodName) != null;
 
         public static bool TypeHasProperty(Type type, string propertyName, bool includeNonPublic = false)
         {
@@ -53,12 +56,7 @@ namespace XppInterpreter.Core
             return type.GetFields(GetBindingFlags(includeNonPublic)).Any(f => f.Name?.ToLower() == fieldName.ToLower());
         }
 
-        public static string GetMethodInvariantName(Type type, string methodName)
-        {
-            return TypeHasMethod(type, methodName)
-                ? type.GetMethods().FirstOrDefault(m => m.Name.ToLowerInvariant() == methodName.ToLowerInvariant()).Name
-                : null;
-        }
+        public static string GetMethodInvariantName(Type type, string methodName) => FindMethod(type, methodName)?.Name;
 
         public static PropertyInfo GetProperty(Type type, string propertyName, bool includeNonPublic = false)
         {
@@ -86,21 +84,98 @@ namespace XppInterpreter.Core
             return bindingFlags;
         }
 
-        public static MethodInfo GetMethod(Type type, string methodName)
-        {
-            string invariantMethodName = GetMethodInvariantName(type, methodName);
+        public static MethodInfo GetMethod(Type type, string methodName) => FindMethod(type, methodName);
 
-            return !string.IsNullOrEmpty(invariantMethodName)
-                ? type.GetMethods().FirstOrDefault(m => m.Name.ToLowerInvariant() == methodName.ToLowerInvariant())
-                : null;
+        /// <summary>
+        /// A kernel class whose constructor takes variable arguments, like Struct, receives them in an array.
+        /// </summary>
+        public static object[] PackConstructorArguments(Type type, object[] arguments)
+        {
+            var constructors = type.GetConstructors();
+
+            if (constructors.Any(c => c.GetParameters().Length == arguments.Length && !IsVariableArguments(c))
+                || !constructors.Any(IsVariableArguments)
+                || (arguments.Length == 1 && (arguments[0] is null || arguments[0] is object[])))
+            {
+                return arguments;
+            }
+
+            return new object[] { arguments };
         }
 
-        public static bool TypeImplementsInterface(Type type, Type interfaceType)
+        private static bool IsVariableArguments(ConstructorInfo constructor)
         {
-            if (type is null || interfaceType is null) return false;
-            
-            TypeInfo typeInfo = type as TypeInfo;
-            return typeInfo != null && typeInfo.ImplementedInterfaces.Contains(interfaceType);
+            var parameters = constructor.GetParameters();
+
+            return parameters.Length == 1 && parameters[0].ParameterType == typeof(object[]);
+        }
+
+        public static object CastToMap(object record, Type mapType)
+        {
+            Type common = record.GetType();
+
+            while (common != null && common.FullName != "Microsoft.Dynamics.Ax.Xpp.Common")
+            {
+                common = common.BaseType;
+            }
+
+            if (common is null)
+            {
+                throw new InvalidCastException($"Cannot convert from type '{record.GetType().Name}' to type '{mapType.Name}'.");
+            }
+
+            MethodInfo cast = common.Assembly.GetType("Microsoft.Dynamics.Ax.Xpp.CastHelper").GetMethod("CastCommon").MakeGenericMethod(mapType);
+            ParameterInfo[] parameters = cast.GetParameters();
+
+            const int targetIsMap = 1, implicitContext = 0;
+
+            try
+            {
+                return cast.Invoke(null, new[]
+                {
+                    record,
+                    Enum.ToObject(parameters[1].ParameterType, targetIsMap),
+                    Enum.ToObject(parameters[2].ParameterType, implicitContext)
+                });
+            }
+            catch (TargetInvocationException exception) when (exception.InnerException != null)
+            {
+                System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(exception.InnerException).Throw();
+                throw;
+            }
+        }
+
+        /// <summary>
+        /// A kernel method with variable arguments, like DictClass.callStatic(name, ...), receives them in an array.
+        /// </summary>
+        public static object[] PackVariableArguments(Type type, string methodName, object[] arguments)
+        {
+            var methods = type.GetMethods().Where(m => string.Equals(m.Name, methodName, StringComparison.OrdinalIgnoreCase)).ToArray();
+
+            if (methods.Length != 1)
+            {
+                return arguments;
+            }
+
+            var parameters = methods[0].GetParameters();
+            int fixedCount = parameters.Length - 1;
+
+            if (parameters.Length == 0 || parameters[fixedCount].ParameterType != typeof(object[]) || arguments.Length < fixedCount)
+            {
+                return arguments;
+            }
+
+            if (arguments.Length == parameters.Length && (arguments[fixedCount] is null || arguments[fixedCount] is object[]))
+            {
+                return arguments;
+            }
+
+            object[] packed = new object[parameters.Length];
+
+            Array.Copy(arguments, packed, fixedCount);
+            packed[fixedCount] = arguments.Skip(fixedCount).ToArray();
+
+            return packed;
         }
 
         public static bool IsDelegateType(Type type)

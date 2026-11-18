@@ -11,6 +11,8 @@
         public readonly IXppExceptionsProxy Exceptions;
         public readonly IXppQueryGenerationProxy QueryGeneration;
 
+        public readonly Core.Clr.ClrTypeResolver ClrTypes;
+
         public XppProxy(
             IIntrinsicFunctionProvider intrinsic,
             IXppBinaryOperationProxy binary,
@@ -29,6 +31,7 @@
             Reflection = reflection;
             Exceptions = exceptions;
             QueryGeneration = queryGeneration;
+            ClrTypes = new Core.Clr.ClrTypeResolver(reflection.GetReferencedAssemblies);
         }
     }
 }

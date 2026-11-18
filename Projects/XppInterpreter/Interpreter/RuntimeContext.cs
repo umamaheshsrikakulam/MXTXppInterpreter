@@ -16,12 +16,17 @@ namespace XppInterpreter.Interpreter
         public Stack<object> Stack => ScopeHandler.CurrentScope.Stack;
         public Dictionary<Parser.Data.Query, ISearchInstance> Queries = new Dictionary<Parser.Data.Query, ISearchInstance>();
         public Stack<IDisposable> Disposables = new Stack<IDisposable>();
+
+        internal readonly System.Runtime.CompilerServices.ConditionalWeakTable<object, ISearchInstance> PendingFetches = new System.Runtime.CompilerServices.ConditionalWeakTable<object, ISearchInstance>();
         public readonly ScopeHandler ScopeHandler;
         public readonly XppProxy Proxy;
         public readonly ByteCode ByteCode;
-        public Exception LastException;
 
         public bool Returned;
+        public object ReturnValue;
+        internal PendingExit PendingExit;
+        internal readonly Stack<FinallyBlock> FinallyBlocks = new Stack<FinallyBlock>();
+        internal int NativeRetryCount = -1;
         public RuntimeContext InnerContext;
         public XppInterpreter Interpreter;
         public DebugAction NextAction;
@@ -63,6 +68,56 @@ namespace XppInterpreter.Interpreter
             }
 
             _pc = counter;
+        }
+
+        internal void BeginExit(PendingExit exit)
+        {
+            PendingExit = exit;
+            ContinueExit();
+        }
+
+        /// <summary>
+        /// Goes to the finally block of the next try statement, or finishes the exit when there are no more.
+        /// </summary>
+        internal void ContinueExit()
+        {
+            var exit = PendingExit;
+
+            if (exit.HandlersToLeave > 0)
+            {
+                exit.HandlersToLeave--;
+                ScopeHandler.CurrentExceptionHandler.MoveToEnd(this);
+                return;
+            }
+
+            PendingExit = null;
+
+            if (exit.IsReturn)
+            {
+                Returned = true;
+            }
+            else if (exit.IsRetry)
+            {
+                ScopeHandler.CurrentExceptionHandler.ExecuteRetry(this);
+            }
+            else
+            {
+                int offset = exit.TargetCounter - Counter;
+
+                EndScopeRange(offset < 0 ? exit.TargetCounter : Counter, Math.Abs(offset));
+                SetCounter(exit.TargetCounter);
+            }
+        }
+
+        /// <summary>
+        /// An exception that leaves a finally block replaces what the block was holding
+        /// </summary>
+        internal void AbandonFinallyBlocks(int handlerCount)
+        {
+            while (FinallyBlocks.Count > 0 && FinallyBlocks.Peek().HandlerCount >= handlerCount)
+            {
+                FinallyBlocks.Pop();
+            }
         }
 
         public void EndScopeRange(int start, int end)
